@@ -214,6 +214,7 @@ time_t get_next_calendar_realtime(int tw, int th, int tm_min)
 			t.tm_mday += 7;
 		}
 
+		t.tm_isdst = -1; /* 서머타임(DST) 시스템 재판단 지시 */
 		next_t = mktime(&t);
 	}
 
@@ -226,6 +227,7 @@ time_t get_next_calendar_realtime(int tw, int th, int tm_min)
 				t.tm_hour = 0;
 			}
 
+			t.tm_isdst = -1; /* 요일 점프 시에도 DST 재판단 */
 			next_t = mktime(&t);
 		}
 	}
@@ -467,6 +469,9 @@ void *scheduler_loop(void *arg)
 						ctx.task_id = t->id;
 						t->func(&ctx);
 						pthread_mutex_lock(&s->lock);
+
+						/* 락 해제 후 배열이 REALLOC 되었을 수 있으므로 포인터 주소 재할당 */
+						t = &s->tasks[i];
 						t->is_running_now--;
 					}
 
@@ -558,6 +563,13 @@ void scheduler_stop(struct scheduler *s, int timeout_sec)
 	pthread_mutex_lock(&s->lock);
 	while (s->active_jobs > 0 && pthread_cond_timedwait(&s->wakeup_cond, &s->lock, &ts) != ETIMEDOUT) {
 		/* Do nothing */
+	}
+
+	/* 타임아웃이 넘었는데도 일하는 좀비 스레드가 있다면, 메모리 해제를 포기하고 크래시를 방지함 */
+	if (s->active_jobs > 0) {
+		printf("\n[Warning] 타임아웃 초과! 워커 스레드가 아직 실행 중이므로 메모리 강제 해제를 스킵합니다.\n");
+		pthread_mutex_unlock(&s->lock);
+		return;
 	}
 
 	curr = s->job_head;
@@ -720,8 +732,8 @@ void task_verify_success(struct task_context *ctx)
 
 	get_current_time_str(time_str, sizeof(time_str));
 	atomic_fetch_add(&success_count, 1);
-	printf("[%s] 🟢 [검증 작업] 실행 완료! (ID:%lu, 현재 카운트: %d, Thread:%lu)\n",
-			time_str, ctx->task_id, atomic_load(&success_count), pthread_self());
+	printf("[%s] 🟢 [검증 작업] 실행 완료! (ID:%lu, 현재 카운트: %d)\n",
+			time_str, ctx->task_id, atomic_load(&success_count));
 }
 
 int main(void)
@@ -748,16 +760,10 @@ int main(void)
 	scheduler_add_calendar(&s, DAY_WED, 9, 0, 1, 0, POLICY_OVERLAP, task_example_log, "월/수/금 09:00 시스템 점검 (수)");
 	scheduler_add_calendar(&s, DAY_FRI, 9, 0, 1, 0, POLICY_OVERLAP, task_example_log, "월/수/금 09:00 시스템 점검 (금)");
 
-	scheduler_add_periodic(&s, 5000, 1, 0, POLICY_OVERLAP, task_example_log, "⏱️ 5초 주기 핑(Ping) 테스트");
-
-	scheduler_add_oneshot(&s, 0, 1, task_verify_success, NULL);
-	scheduler_add_oneshot(&s, 2000, 0, task_verify_success, NULL);
-	scheduler_add_oneshot(&s, 4000, 0, task_verify_success, NULL);
-	scheduler_add_periodic(&s, 6000, 1, 0, POLICY_OVERLAP, task_verify_success, NULL);
+	//scheduler_add_periodic(&s, 5000, 1, 0, POLICY_OVERLAP, task_example_log, "⏱️ 5초 주기 핑(Ping) 테스트");
 
 	printf("  -> ✅ 다양한 캘린더 예약이 큐에 안전하게 등록되었습니다.\n\n");
-
-	sleep(60*60*24*24);
+	sleep(60*60*24*8);
 
 	printf("📝 [Part 2] 스케줄러 코어 엔진 자동 검증 시작\n");
 	atomic_store(&success_count, 0);
