@@ -62,17 +62,17 @@ static inline unsigned long os_thread_get_id(void) { return (unsigned long)pthre
 /* --- OSAL 최상위 객체 헤더 (Reference Count) --- */
 typedef struct os_object {
 	atomic_int ref_count;
-	void (*destructor)(void *obj);
+	void (*dtor)(void *obj);
 } os_object_t;
 
-static inline void os_obj_init(void *obj, void (*destructor)(void *))
+static inline void os_obj_init(void *obj, void (*dtor)(void *))
 {
 	os_object_t *o = (os_object_t *)obj;
 	atomic_init(&o->ref_count, 1);
-	o->destructor = destructor;
+	o->dtor = dtor;
 }
 
-static inline void *os_obj_retain(void *obj)
+static inline void *os_obj_hold(void *obj)
 {
 	os_object_t *o = (os_object_t *)obj;
 	if (o) atomic_fetch_add(&o->ref_count, 1);
@@ -83,8 +83,11 @@ static inline void os_obj_release(void *obj)
 {
 	os_object_t *o = (os_object_t *)obj;
 	if (o && atomic_fetch_sub(&o->ref_count, 1) == 1) {
-		if (o->destructor) o->destructor(o);
-		else FREE(o);
+		if (o->dtor) {
+			o->dtor(o);
+		} else {
+			FREE(o);
+		}
 	}
 }
 
@@ -124,7 +127,8 @@ void os_event_set(os_event_t *e)
 	pthread_mutex_unlock(&e->lock);
 }
 
-static struct timespec _get_mono_timespec(long ms) {
+static struct timespec _get_mono_timespec(long ms)
+{
 	struct timespec ts;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	ts.tv_sec += ms / 1000;
@@ -159,7 +163,11 @@ int os_event_wait(os_event_t *e, long timeout_ms)
 }
 
 /* --- OSAL 소유권 기반 Queue (Ref-counted Ring Buffer) --- */
+
+#define OS_QUEUE_MIN_CAPACITY 16
+
 typedef struct os_queue {
+	os_mutex_t lock;
 	void **items;
 	int capacity;
 	int head;
@@ -167,10 +175,17 @@ typedef struct os_queue {
 	int count;
 } os_queue_t;
 
+#define os_queue_item(q, i, type) \
+	((type *)((q)->items[((q)->head + (i)) % (q)->capacity]))
+
+#define os_queue_foreach(item_ptr, q, type, i) \
+	for ((i) = 0; ((i) < (q)->count) && (((item_ptr) = os_queue_item(q, i, type)) || 1); (i)++)
+
 os_queue_t *os_queue_new(void)
 {
 	os_queue_t *q = MALLOC(sizeof(os_queue_t));
-	q->capacity = 16;
+	os_mutex_init(&q->lock);
+	q->capacity = OS_QUEUE_MIN_CAPACITY;
 	q->items = MALLOC(sizeof(void *) * q->capacity);
 	q->head = 0;
 	q->tail = 0;
@@ -181,14 +196,17 @@ os_queue_t *os_queue_new(void)
 void os_queue_insert(os_queue_t *q, void *p)
 {
 	int i, new_cap;
-	void **new_items;
-	os_obj_retain(p); 
+	void **new_items, *e;
+
+	os_obj_hold(p); 
+
+	os_mutex_lock(&q->lock);
 
 	if (q->count == q->capacity) {
 		new_cap = q->capacity * 2;
 		new_items = MALLOC(sizeof(void *) * new_cap);
-		for (i = 0; i < q->count; i++) {
-			new_items[i] = q->items[(q->head + i) % q->capacity];
+		os_queue_foreach(e, q, void, i) {
+			new_items[i] = e;
 		}
 		FREE(q->items);
 		q->items = new_items;
@@ -200,16 +218,39 @@ void os_queue_insert(os_queue_t *q, void *p)
 	q->items[q->tail] = p;
 	q->tail = (q->tail + 1) % q->capacity;
 	q->count++;
+
+	os_mutex_unlock(&q->lock);
 }
 
-void *os_queue_get(os_queue_t *q)
+void *os_queue_pop(os_queue_t *q)
 {
-	void *p;
-	if (q->count == 0) return NULL;
+	void *p = NULL;
+	int i, new_cap;
+	void **new_items, *e;
 
-	p = q->items[q->head];
-	q->head = (q->head + 1) % q->capacity;
-	q->count--;
+	os_mutex_lock(&q->lock);
+
+	if (q->count > 0) {
+		p = q->items[q->head];
+		q->head = (q->head + 1) % q->capacity;
+		q->count--;
+		if (q->capacity > OS_QUEUE_MIN_CAPACITY && q->count <= q->capacity / 4) {
+			new_cap = q->capacity / 2;
+			new_items = MALLOC(sizeof(void *) * new_cap);
+			if (new_items) {
+				os_queue_foreach(e, q, void, i) {
+					new_items[i] = e;
+				}
+				FREE(q->items);
+				q->items = new_items;
+				q->head = 0;
+				q->tail = q->count;
+				q->capacity = new_cap;
+			}
+		}
+	}
+
+	os_mutex_unlock(&q->lock);
 	return p; 
 }
 
@@ -219,11 +260,15 @@ void os_queue_free(os_queue_t *q)
 	void *p;
 	if (!q) return;
 
+	os_mutex_lock(&q->lock);
 	for (i = 0; i < q->count; i++) {
 		p = q->items[(q->head + i) % q->capacity];
 		os_obj_release(p); 
 	}
 	FREE(q->items);
+	os_mutex_unlock(&q->lock);
+
+	os_mutex_destroy(&q->lock);
 	FREE(q);
 }
 
@@ -430,7 +475,8 @@ struct urgent_args {
 	struct job_item *job; 
 };
 
-void urgent_args_dtor(void *obj) {
+void urgent_args_dtor(void *obj)
+{
 	struct urgent_args *uargs = (struct urgent_args *)obj;
 	os_obj_release(uargs->job); 
 	FREE(uargs);                
@@ -474,7 +520,7 @@ void *worker_proc(void *arg)
 		job = NULL;
 
 		os_mutex_lock(&s->lock);
-		job = (struct job_item *)os_queue_get(s->job_queue);
+		job = (struct job_item *)os_queue_pop(s->job_queue);
 		if (job) {
 			s->queued_jobs--;
 			s->busy_workers++;
@@ -598,7 +644,7 @@ void *scheduler_loop(void *arg)
 							uargs = MALLOC(sizeof(struct urgent_args));
 							os_obj_init(uargs, urgent_args_dtor);
 							uargs->sched = s;
-							uargs->job = os_obj_retain(j);
+							uargs->job = os_obj_hold(j);
 
 							if (os_thread_create(&tid, urgent_worker_proc, uargs) == 0) {
 								os_thread_detach(tid);
