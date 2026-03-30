@@ -319,6 +319,7 @@ void *worker_proc(void *arg)
 			if (pthread_cond_timedwait(&s->job_cond, &s->lock, &out) == ETIMEDOUT) {
 				if (s->cur_workers > MIN_WORKERS) {
 					s->cur_workers--;
+					pthread_cond_broadcast(&s->wakeup_cond);
 					pthread_mutex_unlock(&s->lock);
 					return NULL;
 				}
@@ -327,6 +328,7 @@ void *worker_proc(void *arg)
 
 		if (s->is_shutting_down) {
 			s->cur_workers--;
+			pthread_cond_broadcast(&s->wakeup_cond);
 			pthread_mutex_unlock(&s->lock);
 			break;
 		}
@@ -463,11 +465,15 @@ void *scheduler_loop(void *arg)
 							pthread_cond_signal(&s->job_cond);
 						}
 					} else {
-						pthread_mutex_unlock(&s->lock);
 						ctx.sched = s;
 						ctx.user_arg = t->arg;
 						ctx.task_id = t->id;
-						t->func(&ctx);
+						task_func_t safe_func = t->func;
+
+						pthread_mutex_unlock(&s->lock);
+
+						safe_func(&ctx);
+
 						pthread_mutex_lock(&s->lock);
 
 						/* 락 해제 후 배열이 REALLOC 되었을 수 있으므로 포인터 주소 재할당 */
@@ -561,12 +567,12 @@ void scheduler_stop(struct scheduler *s, int timeout_sec)
 	ts.tv_sec += timeout_sec;
 
 	pthread_mutex_lock(&s->lock);
-	while (s->active_jobs > 0 && pthread_cond_timedwait(&s->wakeup_cond, &s->lock, &ts) != ETIMEDOUT) {
+	while ((s->active_jobs > 0 || s->cur_workers > 0) && pthread_cond_timedwait(&s->wakeup_cond, &s->lock, &ts) != ETIMEDOUT) {
 		/* Do nothing */
 	}
 
 	/* 타임아웃이 넘었는데도 일하는 좀비 스레드가 있다면, 메모리 해제를 포기하고 크래시를 방지함 */
-	if (s->active_jobs > 0) {
+	if (s->active_jobs > 0 || s->cur_workers > 0) {
 		printf("\n[Warning] 타임아웃 초과! 워커 스레드가 아직 실행 중이므로 메모리 강제 해제를 스킵합니다.\n");
 		pthread_mutex_unlock(&s->lock);
 		return;
@@ -752,13 +758,14 @@ int main(void)
 	printf("📝 [Part 1] 실무 달력(Calendar) 예약 예제 등록 중...\n");
 
 	scheduler_add_calendar(&s, DAY_ANY, TIME_ANY, 0, 1, 0, POLICY_OVERLAP, task_example_log, "매시 정각(00분) 데이터 동기화");
-	scheduler_add_calendar(&s, DAY_ANY, TIME_ANY, 30, 1, 0, POLICY_OVERLAP, task_example_log, "매시 30분 시스템 헬스 체크");
-	scheduler_add_calendar(&s, DAY_ANY, 14, 15, 1, 0, POLICY_OVERLAP, task_example_log, "매일 14:15 일일 정산 작업");
-	scheduler_add_calendar(&s, DAY_FRI, 18, 0, 1, 0, POLICY_OVERLAP, task_example_log, "매주 금요일 18:00 주간 DB 백업");
+	//scheduler_add_calendar(&s, DAY_ANY, TIME_ANY, 30, 1, 0, POLICY_OVERLAP, task_example_log, "매시 30분 시스템 헬스 체크");
+	//scheduler_add_calendar(&s, DAY_ANY, 14, 15, 1, 0, POLICY_OVERLAP, task_example_log, "매일 14:15 일일 정산 작업");
+	scheduler_add_calendar(&s, DAY_MON, 11, 0, 1, 0, POLICY_OVERLAP, task_example_log, "매주 월요일 11:00 주간 DB 백업");
+	scheduler_add_calendar(&s, DAY_MON, 0, 0, 1, 0, POLICY_OVERLAP, task_example_log, "매주 월요일 00:00 주간 DB 백업");
 
-	scheduler_add_calendar(&s, DAY_MON, 9, 0, 1, 0, POLICY_OVERLAP, task_example_log, "월/수/금 09:00 시스템 점검 (월)");
-	scheduler_add_calendar(&s, DAY_WED, 9, 0, 1, 0, POLICY_OVERLAP, task_example_log, "월/수/금 09:00 시스템 점검 (수)");
-	scheduler_add_calendar(&s, DAY_FRI, 9, 0, 1, 0, POLICY_OVERLAP, task_example_log, "월/수/금 09:00 시스템 점검 (금)");
+	scheduler_add_calendar(&s, DAY_MON, 12, 0, 1, 0, POLICY_OVERLAP, task_example_log, "월/수/금 12:00 시스템 점검 (월)");
+	scheduler_add_calendar(&s, DAY_WED, 12, 0, 1, 0, POLICY_OVERLAP, task_example_log, "월/수/금 12:00 시스템 점검 (수)");
+	scheduler_add_calendar(&s, DAY_FRI, 12, 0, 1, 0, POLICY_OVERLAP, task_example_log, "월/수/금 12:00 시스템 점검 (금)");
 
 	//scheduler_add_periodic(&s, 5000, 1, 0, POLICY_OVERLAP, task_example_log, "⏱️ 5초 주기 핑(Ping) 테스트");
 
