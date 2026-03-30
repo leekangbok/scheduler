@@ -502,6 +502,12 @@ struct timespec timespec_now_monotonic(void)
 	return ts;
 }
 
+static inline long get_mono_ms(void)
+{
+	struct timespec ts = timespec_now_monotonic();
+	return ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
 struct timespec timespec_add_ms(struct timespec ts, long ms)
 {
 	ts.tv_sec += ms / 1000;
@@ -567,8 +573,10 @@ static int get_available_slot(struct scheduler *s)
 		if (!s->tasks[i].is_active && s->tasks[i].is_running_now == 0) return i;
 	}
 	if (s->task_count >= s->capacity) {
+		int old_cap = s->capacity;
 		s->capacity *= 2;
 		s->tasks = os_realloc(&s->allocs.core, s->tasks, sizeof(struct task) * s->capacity);
+		memset(&s->tasks[old_cap], 0, sizeof(struct task) * (s->capacity - old_cap));
 	}
 	return s->task_count++;
 }
@@ -727,9 +735,13 @@ void *scheduler_loop(void *arg)
 								os_str_get(&tt), os_str_get(&t->name), t->id);
 						os_str_free(&time_allocator, &tt);
 						if (t->type == TYPE_RELATIVE) {
-							do {
-								t->next_run = timespec_add_ms(t->next_run, t->interval_ms);
-							} while (timespec_cmp(&t->next_run, &now_mono) <= 0);
+							if (t->interval_ms > 0) {
+								do {
+									t->next_run = timespec_add_ms(t->next_run, t->interval_ms);
+								} while (timespec_cmp(&t->next_run, &now_mono) <= 0);
+							} else {
+								t->next_run = timespec_add_ms(now_mono, 1000); /* 0일 경우 강제로 1초 뒤로 밀어버림 */
+							}
 						} else {
 							t->target_realtime = get_next_calendar_realtime(t->w, t->h, t->m);
 						}
@@ -879,7 +891,7 @@ void scheduler_start(struct scheduler *s)
 
 int scheduler_stop(struct scheduler *s, int timeout_sec)
 {
-	long elapsed = 0;
+	long start_ms;
 	int total_leaks, i;
 
 	os_mutex_lock(&s->lock);
@@ -891,16 +903,16 @@ int scheduler_stop(struct scheduler *s, int timeout_sec)
 
 	os_thread_join(s->scheduler_thread);
 
-	while (elapsed < timeout_sec * 1000) {
+	start_ms = get_mono_ms();
+	while (1) {
 		os_mutex_lock(&s->lock);
 		int remaining = s->active_jobs + s->cur_workers;
 		os_mutex_unlock(&s->lock);
 
 		if (remaining == 0) break;
+		if (get_mono_ms() - start_ms >= timeout_sec * 1000) break;
 
 		os_event_wait(s->wakeup_event, 100);
-		elapsed += 100;
-
 		os_event_set(s->job_event); 
 	}
 
