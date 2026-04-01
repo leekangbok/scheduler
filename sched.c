@@ -9,7 +9,7 @@
 #include <stdint.h>
 #include <stdatomic.h>
 #include <signal.h>
-#include <stdarg.h> /* 🚨 가변 인자 처리를 위해 추가 */
+#include <stdarg.h>
 
 /* ========================================================================= *
  * [1] OS 메모리 할당기 (Categorized Memory Allocator)
@@ -58,7 +58,7 @@ static inline void *os_realloc(os_allocator_t *alloc, void *ptr, size_t size)
 
 typedef struct os_str {
 	int len;
-	int is_dynamic; /* 0: 내부 로컬 버퍼 사용, 1: 힙 포인터 사용 */
+	int is_dynamic;
 	union {
 		char local[OS_SSO_LEN];
 		char *heap;
@@ -76,7 +76,6 @@ static inline os_str_t os_str_fmt(os_allocator_t *alloc, const char *fmt, ...)
 	va_list args;
 	memset(&res, 0, sizeof(res));
 
-	/* 1단계: 버퍼 없이 길이만 계산 (vsnprintf의 마법) */
 	va_start(args, fmt);
 	res.len = vsnprintf(NULL, 0, fmt, args);
 	va_end(args);
@@ -86,7 +85,6 @@ static inline os_str_t os_str_fmt(os_allocator_t *alloc, const char *fmt, ...)
 		return res;
 	}
 
-	/* 2단계: 크기에 따라 분기 (SSO 핵심 로직) */
 	if (res.len < OS_SSO_LEN) {
 		res.is_dynamic = 0;
 		va_start(args, fmt);
@@ -100,7 +98,7 @@ static inline os_str_t os_str_fmt(os_allocator_t *alloc, const char *fmt, ...)
 			vsnprintf(res.data.heap, res.len + 1, fmt, args);
 			va_end(args);
 		} else {
-			res.len = 0; /* 할당 실패 시 방어 */
+			res.len = 0;
 		}
 	}
 	return res;
@@ -124,6 +122,39 @@ static inline os_str_t os_str_dup(os_allocator_t *alloc, const os_str_t *src)
 	return res;
 }
 
+static inline int os_str_set(os_allocator_t *alloc, os_str_t *s, const char *str, size_t len)
+{
+	if (!s)
+		return -1;
+
+	if (!str) {
+		s->len = 0;
+		s->is_dynamic = 0;
+		s->data.heap[0] = '\0';
+		return 0;
+	}
+
+	s->len = len;
+
+	if (len < OS_SSO_LEN) {
+		s->is_dynamic = 0;
+		memcpy(s->data.local, str, len);
+		s->data.local[len] = '\0';
+	} else {
+		s->is_dynamic = 1;
+		s->data.heap = os_malloc(alloc, len + 1);
+		if (!s->data.heap) {
+			s->len = 0;
+			s->is_dynamic = 0;
+			return -1;
+		}
+		memcpy(s->data.heap, str, len);
+		s->data.heap[len] = '\0';
+	}
+
+	return 0;
+}
+
 static inline void os_str_free(os_allocator_t *alloc, os_str_t *s)
 {
 	if (s->is_dynamic && s->data.heap) {
@@ -132,7 +163,6 @@ static inline void os_str_free(os_allocator_t *alloc, os_str_t *s)
 	}
 	memset(s, 0, sizeof(os_str_t));
 }
-
 
 /* ========================================================================= *
  * [3] OS 추상화 계층 (Event & Queue 모델)
@@ -184,7 +214,6 @@ static inline void os_obj_release(void *obj)
 	}
 }
 
-/* --- OSAL Event --- */
 typedef struct os_event {
 	os_allocator_t *alloc;
 	pthread_mutex_t lock;
@@ -381,18 +410,14 @@ enum overrun_policy {
 
 enum schedule_type {
 	TYPE_RELATIVE = 0,
-	TYPE_CALENDAR = 1
+	TYPE_CALENDAR = 1,
+	TYPE_CHAINED = 2
 };
 
 enum week_day {
 	DAY_ANY = -1,
-	DAY_SUN = 0,
-	DAY_MON = 1,
-	DAY_TUE = 2,
-	DAY_WED = 3,
-	DAY_THU = 4,
-	DAY_FRI = 5,
-	DAY_SAT = 6
+	DAY_SUN = 0, DAY_MON = 1, DAY_TUE = 2,
+	DAY_WED = 3, DAY_THU = 4, DAY_FRI = 5, DAY_SAT = 6
 };
 
 struct scheduler;
@@ -401,20 +426,19 @@ struct task_context {
 	struct scheduler *sched;
 	void *user_arg;
 	uint64_t task_id;
-	const char *task_name; /* 출력하기 편하게 포인터로 연결 */
+	const char *task_name;
 };
 
 typedef void (*task_func_t)(struct task_context *ctx);
 
 struct job_item {
 	os_object_t base; 
-	os_str_t name; /* 🚨 SSO 동적 문자열 객체 탑재! */
+	os_str_t name; 
 	task_func_t func;
 	void *arg;
 	uint64_t task_id;
 };
 
-/* 🚨 Job Item 객체가 파괴될 때 동적 문자열도 알아서 뱉어내도록 소멸자 구현 */
 void job_item_dtor(void *obj)
 {
 	struct job_item *j = (struct job_item *)obj;
@@ -423,18 +447,18 @@ void job_item_dtor(void *obj)
 
 struct task {
 	uint64_t id;
-	os_str_t name; /* 🚨 SSO 동적 문자열 객체 탑재! */
+	os_str_t name; 
 	int is_active;
 	int is_periodic;
 	enum schedule_type type;
+
+	uint64_t chain_to_id; 
 
 	struct timespec next_run;
 	time_t target_realtime;
 
 	long interval_ms;
-	int w;
-	int h;
-	int m;
+	int w, h, m;
 	int use_thread;
 	int is_urgent;
 	enum overrun_policy policy;
@@ -476,10 +500,9 @@ struct scheduler {
  * ========================================================================= */
 
 os_allocator_t time_allocator = { .name = "timedates", 
-	.cur_allocs = ATOMIC_VAR_INIT(0), 
-	.tot_allocs = ATOMIC_VAR_INIT(0)};
+	.cur_allocs = 0, /* 최신 C 표준 지정 초기화자 (ATOMIC_VAR_INIT 제거) */
+	.tot_allocs = 0};
 
-/* 🚨 안전한 값 반환 래퍼: 포인터 Decay 버그 완벽 차단! */
 os_str_t get_current_time_str(void)
 {
 	os_str_t res;
@@ -512,7 +535,6 @@ struct timespec timespec_add_ms(struct timespec ts, long ms)
 {
 	ts.tv_sec += ms / 1000;
 	ts.tv_nsec += (ms % 1000) * 1000000L;
-
 	if (ts.tv_nsec >= 1000000000L) {
 		ts.tv_sec++;
 		ts.tv_nsec -= 1000000000L;
@@ -533,7 +555,6 @@ time_t get_next_calendar_realtime(int tw, int th, int tm_min)
 	time_t now_t = time(NULL);
 	struct tm t;
 	time_t next_t;
-	int diff;
 
 	localtime_r(&now_t, &t);
 	t.tm_sec = 0;
@@ -553,7 +574,7 @@ time_t get_next_calendar_realtime(int tw, int th, int tm_min)
 
 	if (tw >= 0) {
 		if (t.tm_wday != tw) {
-			diff = (tw - t.tm_wday + 7) % 7;
+			int diff = (tw - t.tm_wday + 7) % 7;
 			t.tm_mday += diff;
 			if (th < 0) t.tm_hour = 0;
 			t.tm_isdst = -1; 
@@ -570,12 +591,14 @@ static int get_available_slot(struct scheduler *s)
 {
 	int i;
 	for (i = 0; i < s->task_count; i++) {
-		if (!s->tasks[i].is_active && s->tasks[i].is_running_now == 0) return i;
+		/* 🚨 FIX: func == NULL 인 경우만 완벽히 비어있는 슬롯으로 간주하여 덮어쓰기 방지 */
+		if (!s->tasks[i].is_active && s->tasks[i].is_running_now == 0 && s->tasks[i].func == NULL) return i;
 	}
 	if (s->task_count >= s->capacity) {
 		int old_cap = s->capacity;
 		s->capacity *= 2;
 		s->tasks = os_realloc(&s->allocs.core, s->tasks, sizeof(struct task) * s->capacity);
+		/* 🚨 FIX: 새로 확장된 영역의 쓰레기값 방어 */
 		memset(&s->tasks[old_cap], 0, sizeof(struct task) * (s->capacity - old_cap));
 	}
 	return s->task_count++;
@@ -588,6 +611,17 @@ struct task *find_task(struct scheduler *s, uint64_t id)
 		if (s->tasks[i].id == id) return &s->tasks[i];
 	}
 	return NULL;
+}
+
+/* 체이닝 작업 연쇄 트리거 함수 */
+static inline void _trigger_chain_locked(struct scheduler *s, uint64_t chain_to_id) {
+	if (chain_to_id == 0) return;
+	struct task *ct = find_task(s, chain_to_id);
+	if (ct && ct->type == TYPE_CHAINED) {
+		ct->is_active = 1;
+		ct->next_run = timespec_now_monotonic(); 
+		os_event_set(s->wakeup_event);           
+	}
 }
 
 struct urgent_args {
@@ -612,7 +646,7 @@ void *urgent_worker_proc(void *arg)
 		.sched = s,
 		.user_arg = job->arg,
 		.task_id = job->task_id,
-		.task_name = os_str_get(&job->name) /* 🚨 안전하게 포인터로 꺼내서 컨텍스트에 꽂아줌 */
+		.task_name = os_str_get(&job->name) 
 	};
 
 	job->func(&ctx);
@@ -621,7 +655,10 @@ void *urgent_worker_proc(void *arg)
 	s->active_jobs--;
 
 	t = find_task(s, job->task_id);
-	if (t) t->is_running_now--;
+	if (t) {
+		t->is_running_now--;
+		_trigger_chain_locked(s, t->chain_to_id);
+	}
 	if ((t && t->is_running_now == 0) || s->active_jobs == 0) os_event_set(s->wakeup_event);
 	os_mutex_unlock(&s->lock);
 
@@ -653,7 +690,7 @@ void *worker_proc(void *arg)
 			ctx.sched = s;
 			ctx.user_arg = job->arg;
 			ctx.task_id = job->task_id;
-			ctx.task_name = os_str_get(&job->name); /* 🚨 SSO 포인터 접근 */
+			ctx.task_name = os_str_get(&job->name);
 
 			job->func(&ctx);
 
@@ -662,7 +699,10 @@ void *worker_proc(void *arg)
 			s->active_jobs--;
 
 			t = find_task(s, job->task_id);
-			if (t) t->is_running_now--;
+			if (t) {
+				t->is_running_now--;
+				_trigger_chain_locked(s, t->chain_to_id);
+			}
 			if ((t && t->is_running_now == 0) || s->active_jobs == 0) os_event_set(s->wakeup_event);
 			os_mutex_unlock(&s->lock);
 
@@ -719,7 +759,7 @@ void *scheduler_loop(void *arg)
 			if (!t->is_active) continue;
 
 			run = 0;
-			if (t->type == TYPE_RELATIVE) {
+			if (t->type == TYPE_RELATIVE || t->type == TYPE_CHAINED) {
 				if (timespec_cmp(&t->next_run, &now_mono) <= 0) run = 1;
 			} else {
 				if (t->target_realtime <= now_real) run = 1;
@@ -734,13 +774,15 @@ void *scheduler_loop(void *arg)
 						printf("[%s] ⚠️ [SKIP] '%s' (ID:%lu) 이전 작업 지연으로 인해 실행을 건너뜁니다!\n", 
 								os_str_get(&tt), os_str_get(&t->name), t->id);
 						os_str_free(&time_allocator, &tt);
-						if (t->type == TYPE_RELATIVE) {
+						
+						if (t->type == TYPE_RELATIVE || t->type == TYPE_CHAINED) {
+							/* 🚨 FIX: interval_ms가 0일 때 무한루프(데드락) 방어 */
 							if (t->interval_ms > 0) {
 								do {
 									t->next_run = timespec_add_ms(t->next_run, t->interval_ms);
 								} while (timespec_cmp(&t->next_run, &now_mono) <= 0);
 							} else {
-								t->next_run = timespec_add_ms(now_mono, 1000); /* 0일 경우 강제로 1초 뒤로 밀어버림 */
+								t->next_run = timespec_add_ms(now_mono, 1000);
 							}
 						} else {
 							t->target_realtime = get_next_calendar_realtime(t->w, t->h, t->m);
@@ -755,10 +797,7 @@ void *scheduler_loop(void *arg)
 
 					j = os_malloc(&s->allocs.job, sizeof(struct job_item));
 					os_obj_init(j, &s->allocs.job, job_item_dtor);
-
-					/* 🚨 깊은 복사: t->name의 길이에 따라 알아서 로컬 버퍼 또는 힙 복사가 일어남! */
 					j->name = os_str_dup(&s->allocs.job, &t->name);
-
 					j->func = t->func;
 					j->arg = t->arg;
 					j->task_id = t->id;
@@ -766,7 +805,6 @@ void *scheduler_loop(void *arg)
 					if (t->use_thread) {
 						if (t->is_urgent) {
 							s->active_jobs++;
-
 							uargs = os_malloc(&s->allocs.urgent, sizeof(struct urgent_args));
 							os_obj_init(uargs, &s->allocs.urgent, urgent_args_dtor);
 							uargs->sched = s;
@@ -785,7 +823,6 @@ void *scheduler_loop(void *arg)
 							os_obj_release(j); 
 
 							s->queued_jobs++;
-
 							idle_workers = s->cur_workers - s->busy_workers;
 							if (s->queued_jobs > idle_workers && s->cur_workers < MAX_WORKERS) {
 								if (os_thread_create(&tid, worker_proc, s) == 0) {
@@ -806,21 +843,35 @@ void *scheduler_loop(void *arg)
 						safe_func(&ctx);
 						os_mutex_lock(&s->lock);
 
-						t = &s->tasks[i];
+						t = &s->tasks[i]; 
 						t->is_running_now--;
+						_trigger_chain_locked(s, t->chain_to_id);
 
 						os_obj_release(j);
 					}
 
-					if (t->is_periodic) {
+					/* 🚨 FIX: 체이닝 및 일회성 작업 종료 마커(func = NULL) 기록 */
+					if (t->type == TYPE_CHAINED) {
+						t->is_active = 0; 
+						if (!t->is_periodic) {
+							t->func = NULL;
+							os_str_free(&s->allocs.core, &t->name);
+						}
+					} else if (t->is_periodic) {
 						if (t->type == TYPE_RELATIVE) {
-							t->next_run = timespec_add_ms(t->next_run, t->interval_ms);
+							if (t->interval_ms > 0) {
+								do {
+									t->next_run = timespec_add_ms(t->next_run, t->interval_ms);
+								} while (timespec_cmp(&t->next_run, &now_mono) <= 0);
+							} else {
+								t->next_run = timespec_add_ms(now_mono, 1000);
+							}
 						} else {
 							t->target_realtime = get_next_calendar_realtime(t->w, t->h, t->m);
 						}
 					} else {
 						t->is_active = 0;
-						/* 🚨 일회성 작업이 끝나면 즉시 문자열 메모리 청소! */
+						t->func = NULL; 
 						os_str_free(&s->allocs.core, &t->name);
 					}
 				}
@@ -829,7 +880,7 @@ void *scheduler_loop(void *arg)
 			if (t->is_active) {
 				is_waiting = (t->policy == POLICY_WAIT && t->is_running_now > 0);
 				if (!is_waiting) {
-					if (t->type == TYPE_RELATIVE && timespec_cmp(&t->next_run, &next_w) < 0) {
+					if ((t->type == TYPE_RELATIVE || t->type == TYPE_CHAINED) && timespec_cmp(&t->next_run, &next_w) < 0) {
 						next_w = t->next_run;
 					}
 				}
@@ -891,8 +942,8 @@ void scheduler_start(struct scheduler *s)
 
 int scheduler_stop(struct scheduler *s, int timeout_sec)
 {
-	long start_ms;
 	int total_leaks, i;
+	long start_ms;
 
 	os_mutex_lock(&s->lock);
 	s->is_shutting_down = 1;
@@ -903,6 +954,7 @@ int scheduler_stop(struct scheduler *s, int timeout_sec)
 
 	os_thread_join(s->scheduler_thread);
 
+	/* 🚨 FIX: 실제 물리적 시간을 기준으로 타임아웃 정밀 검사 */
 	start_ms = get_mono_ms();
 	while (1) {
 		os_mutex_lock(&s->lock);
@@ -910,7 +962,7 @@ int scheduler_stop(struct scheduler *s, int timeout_sec)
 		os_mutex_unlock(&s->lock);
 
 		if (remaining == 0) break;
-		if (get_mono_ms() - start_ms >= timeout_sec * 1000) break;
+		if (get_mono_ms() - start_ms >= timeout_sec * 1000) break; 
 
 		os_event_wait(s->wakeup_event, 100);
 		os_event_set(s->job_event); 
@@ -929,9 +981,8 @@ int scheduler_stop(struct scheduler *s, int timeout_sec)
 
 	os_queue_free(s->job_queue);
 
-	/* 🚨 스케줄러가 보유한 모든 작업의 문자열 정리 */
 	for (i = 0; i < s->task_count; i++) {
-		if (s->tasks[i].is_active) {
+		if (s->tasks[i].func != NULL) { /* 슬롯이 살아있다면 메모리 청소 */
 			os_str_free(&s->allocs.core, &s->tasks[i].name);
 		}
 	}
@@ -975,13 +1026,11 @@ uint64_t scheduler_add_oneshot(struct scheduler *s, const char *name, long delay
 	id = s->next_task_id++;
 
 	s->tasks[idx].id = id;
-
-	/* 🚨 SSO 동적 문자열 생성 마법 */
 	s->tasks[idx].name = os_str_fmt(&s->allocs.core, "%s", name ? name : "Unnamed");
-
 	s->tasks[idx].is_active = 1;
 	s->tasks[idx].is_periodic = 0;
 	s->tasks[idx].type = TYPE_RELATIVE;
+	s->tasks[idx].chain_to_id = 0;
 	s->tasks[idx].next_run = timespec_add_ms(timespec_now_monotonic(), delay);
 	s->tasks[idx].interval_ms = 0;
 	s->tasks[idx].w = 0;
@@ -1015,6 +1064,7 @@ uint64_t scheduler_add_periodic(struct scheduler *s, const char *name, long inte
 	s->tasks[idx].is_active = 1;
 	s->tasks[idx].is_periodic = 1;
 	s->tasks[idx].type = TYPE_RELATIVE;
+	s->tasks[idx].chain_to_id = 0;
 
 	if (run_now) {
 		s->tasks[idx].next_run = timespec_now_monotonic();
@@ -1054,6 +1104,7 @@ uint64_t scheduler_add_calendar(struct scheduler *s, const char *name, int w, in
 	s->tasks[idx].is_active = 1;
 	s->tasks[idx].is_periodic = 1;
 	s->tasks[idx].type = TYPE_CALENDAR;
+	s->tasks[idx].chain_to_id = 0;
 
 	if (run_now) {
 		s->tasks[idx].target_realtime = 0; 
@@ -1078,15 +1129,62 @@ uint64_t scheduler_add_calendar(struct scheduler *s, const char *name, int w, in
 	return id;
 }
 
+uint64_t scheduler_add_chain(struct scheduler *s, uint64_t parent_id, const char *name, int is_periodic, int thr, int is_urgent, task_func_t f, void *a)
+{
+	int idx;
+	uint64_t id;
+
+	os_mutex_lock(&s->lock);
+	struct task *parent = find_task(s, parent_id);
+	if (!parent) {
+		os_mutex_unlock(&s->lock);
+		return 0; 
+	}
+
+	idx = get_available_slot(s);
+
+	/* 🚨 FIX: realloc 방어 (포인터 재생성) */
+	parent = find_task(s, parent_id); 
+	if (!parent) {
+		os_mutex_unlock(&s->lock);
+		return 0;
+	}
+
+	id = s->next_task_id++;
+
+	s->tasks[idx].id = id;
+	s->tasks[idx].name = os_str_fmt(&s->allocs.core, "%s", name ? name : "Unnamed");
+	s->tasks[idx].is_active = 0; 
+	s->tasks[idx].is_periodic = is_periodic;
+	s->tasks[idx].type = TYPE_CHAINED;
+	s->tasks[idx].chain_to_id = 0; 
+	s->tasks[idx].interval_ms = 0;
+	s->tasks[idx].w = 0;
+	s->tasks[idx].h = 0;
+	s->tasks[idx].m = 0;
+	s->tasks[idx].use_thread = thr;
+	s->tasks[idx].is_urgent = is_urgent;
+	s->tasks[idx].policy = POLICY_OVERLAP;
+	s->tasks[idx].is_running_now = 0;
+	s->tasks[idx].func = f;
+	s->tasks[idx].arg = a;
+
+	parent->chain_to_id = id;
+
+	os_mutex_unlock(&s->lock);
+	return id;
+}
+
 void scheduler_remove_task(struct scheduler *s, uint64_t id)
 {
 	struct task *t;
 
 	os_mutex_lock(&s->lock);
 	t = find_task(s, id);
-	if (t && t->is_active) {
+	/* 🚨 FIX: func가 등록되어 있다면 무조건 날리기 */
+	if (t && t->func != NULL) {
 		t->is_active = 0;
-		/* 🚨 작업 명시적 삭제 시 메모리 즉각 청소 */
+		t->func = NULL;
 		os_str_free(&s->allocs.core, &t->name);
 	}
 	os_mutex_unlock(&s->lock);
@@ -1098,7 +1196,6 @@ void scheduler_remove_task(struct scheduler *s, uint64_t id)
 
 static atomic_int success_count = 0;
 static struct scheduler *g_sched = NULL;
-
 static volatile sig_atomic_t g_shutdown_flag = 0;
 
 void handle_sigint(int sig)
@@ -1110,7 +1207,6 @@ void handle_sigint(int sig)
 
 void task_verify_ping(struct task_context *ctx)
 {
-	/* 🌟 버퍼 포인터 대신 깔끔한 구조체 멤버 호출! */
 	os_str_t tt = get_current_time_str();
 	printf("[%s] 🟢 [PING] '%s' 시작 (ID:%lu, Thread:%lu) - 14초 딜레이 중...\n",
 			os_str_get(&tt), ctx->task_name, ctx->task_id, os_thread_get_id());
@@ -1140,6 +1236,14 @@ void task_verify_success(struct task_context *ctx)
 	os_str_free(&time_allocator, &tt);
 }
 
+void task_chain_step(struct task_context *ctx)
+{
+	os_str_t tt = get_current_time_str();
+	printf("[%s] 🔗 [체인 실행] '%s' 연쇄 발동 성공! (ID:%lu, Thread:%lu)\n",
+			os_str_get(&tt), ctx->task_name, ctx->task_id, os_thread_get_id());
+	os_str_free(&time_allocator, &tt);
+}
+
 int main(void)
 {
 	struct scheduler s;
@@ -1154,13 +1258,12 @@ int main(void)
 	scheduler_start(&s);
 
 	printf("\n======================================================\n");
-	printf("🚀 OSAL Allocator & SSO 스케줄러 구동 시작\n");
+	printf("🚀 OSAL Allocator, SSO & Job Chaining 스케줄러 구동 시작\n");
 	printf("======================================================\n\n");
 
 	printf("📝 [Part 1] 코어 엔진 자동 검증 시작 (1초 소요)\n");
 	atomic_store(&success_count, 0);
 
-	/* 🌟 긴 이름이 32자를 넘어가면 힙에 동적 할당되는지 볼 수 있습니다! */
 	scheduler_add_periodic(&s, "[SSO_TEST] 매우_긴_이름을_가진_스케줄러_작업입니다_123456789", 5*1000, 1, 0, POLICY_SKIP, 1, task_verify_ping, NULL);
 
 	scheduler_add_oneshot(&s, "1번 원샷", 0, 1, task_verify_success, NULL);
@@ -1171,12 +1274,16 @@ int main(void)
 	c_id = scheduler_add_oneshot(&s, "취소될 작업", 200, 0, task_verify_success, NULL);
 	scheduler_remove_task(&s, c_id);
 
-	sleep(1);
+	printf("\n📝 [Part 2] 파이프라인(Job Chaining) 테스트 등록\n");
+	uint64_t a_id = scheduler_add_oneshot(&s, "체인 루트 작업 [A]", 2000, 1, task_chain_step, NULL);
+	uint64_t b_id = scheduler_add_chain(&s, a_id, "체인 자식 작업 [B]", 0, 1, 0, task_chain_step, NULL);
+	scheduler_add_chain(&s, b_id, "체인 손자 작업 [C]", 0, 1, 0, task_chain_step, NULL);
+	printf("  -> ✅ 파이프라인(A ➡️ B ➡️ C) 예약 완료 (2초 뒤 발동)\n\n");
 
+	sleep(1);
 	scheduler_remove_task(&s, p_id);
 
-	printf("\n📝 [Part 2] 실무 달력(Calendar) 및 주기적(Periodic) 백그라운드 예약 등록\n");
-
+	printf("📝 [Part 3] 실무 달력(Calendar) 및 주기적(Periodic) 백그라운드 예약 등록\n");
 	scheduler_add_calendar(&s, "매시 정각 동기화", DAY_ANY, TIME_ANY, 0, 1, 0, POLICY_OVERLAP, 0, task_example_log, NULL);
 	scheduler_add_calendar(&s, "월요일 11시 백업", DAY_MON, 13, 15, 1, 0, POLICY_OVERLAP, 0, task_example_log, NULL);
 	scheduler_add_calendar(&s, "즉시실행 캘린더", DAY_MON, 0, 0, 1, 0, POLICY_OVERLAP, 1, task_example_log, NULL);
