@@ -562,25 +562,28 @@ time_t get_next_calendar_realtime(int tw, int th, int tm_min)
 	if (tm_min >= 0) t.tm_min = tm_min;
 	if (th >= 0) t.tm_hour = th;
 
+	/* 1. 요일이 지정되어 있다면 먼저 요일을 맞춥니다. */
+	if (tw >= 0) {
+		int diff = (tw - t.tm_wday + 7) % 7;
+		t.tm_mday += diff;
+		t.tm_isdst = -1; /* 서머타임 자동 보정 */
+	}
+
 	next_t = mktime(&t);
 
+	/* 2. 시간을 맞춘 결과가 현재 시간보다 과거라면 다음 주기로 넘깁니다. */
 	if (next_t <= now_t) {
-		if (th < 0) t.tm_hour++;
-		else if (tw < 0) t.tm_mday++;
-		else t.tm_mday += 7;
-		t.tm_isdst = -1; 
+		if (tw >= 0) {
+			t.tm_mday += 7; // 요일이 지정된 경우 1주 뒤로
+		} else if (th < 0) {
+			t.tm_hour++;    // 시간 미지정 시 1시간 뒤로
+		} else {
+			t.tm_mday++;    // 시간 지정, 요일 미지정 시 내일로
+		}
+		t.tm_isdst = -1;
 		next_t = mktime(&t);
 	}
 
-	if (tw >= 0) {
-		if (t.tm_wday != tw) {
-			int diff = (tw - t.tm_wday + 7) % 7;
-			t.tm_mday += diff;
-			if (th < 0) t.tm_hour = 0;
-			t.tm_isdst = -1; 
-			next_t = mktime(&t);
-		}
-	}
 	return next_t;
 }
 
@@ -648,6 +651,8 @@ void *urgent_worker_proc(void *arg)
 		.task_id = job->task_id,
 		.task_name = os_str_get(&job->name) 
 	};
+
+	printf("######### urgent worker run #########\n");
 
 	job->func(&ctx);
 
@@ -1264,31 +1269,32 @@ int main(void)
 	printf("📝 [Part 1] 코어 엔진 자동 검증 시작 (1초 소요)\n");
 	atomic_store(&success_count, 0);
 
-	scheduler_add_periodic(&s, "[SSO_TEST] 매우_긴_이름을_가진_스케줄러_작업입니다_123456789", 5*1000, 1, 0, POLICY_SKIP, 1, task_verify_ping, NULL);
+	//scheduler_add_periodic(&s, "[SSO_TEST] 매우_긴_이름을_가진_스케줄러_작업입니다_123456789", 5*1000, 1, 0, POLICY_SKIP, 1, task_verify_ping, NULL);
 
 	scheduler_add_oneshot(&s, "1번 원샷", 0, 1, task_verify_success, NULL);
 	scheduler_add_oneshot(&s, "2번 원샷", 100, 0, task_verify_success, NULL);
 	scheduler_add_oneshot(&s, "3번 원샷", 300, 0, task_verify_success, NULL);
-	uint64_t p_id = scheduler_add_periodic(&s, "4번 주기(700ms)", 700, 1, 0, POLICY_OVERLAP, 0, task_verify_success, NULL);
+	
+	uint64_t p_id = scheduler_add_periodic(&s, "4번 주기(700ms)", 30*60*1000, 1, 1, POLICY_OVERLAP, 0, task_verify_success, NULL);
 
 	c_id = scheduler_add_oneshot(&s, "취소될 작업", 200, 0, task_verify_success, NULL);
 	scheduler_remove_task(&s, c_id);
 
-	printf("\n📝 [Part 2] 파이프라인(Job Chaining) 테스트 등록\n");
-	uint64_t a_id = scheduler_add_oneshot(&s, "체인 루트 작업 [A]", 2000, 1, task_chain_step, NULL);
-	uint64_t b_id = scheduler_add_chain(&s, a_id, "체인 자식 작업 [B]", 0, 1, 0, task_chain_step, NULL);
-	scheduler_add_chain(&s, b_id, "체인 손자 작업 [C]", 0, 1, 0, task_chain_step, NULL);
-	printf("  -> ✅ 파이프라인(A ➡️ B ➡️ C) 예약 완료 (2초 뒤 발동)\n\n");
+	//printf("\n📝 [Part 2] 파이프라인(Job Chaining) 테스트 등록\n");
+	//uint64_t a_id = scheduler_add_oneshot(&s, "체인 루트 작업 [A]", 2000, 1, task_chain_step, NULL);
+	//uint64_t b_id = scheduler_add_chain(&s, a_id, "체인 자식 작업 [B]", 0, 1, 0, task_chain_step, NULL);
+	//scheduler_add_chain(&s, b_id, "체인 손자 작업 [C]", 0, 1, 0, task_chain_step, NULL);
+	//printf("  -> ✅ 파이프라인(A ➡️ B ➡️ C) 예약 완료 (2초 뒤 발동)\n\n");
 
 	sleep(1);
-	scheduler_remove_task(&s, p_id);
+	//scheduler_remove_task(&s, p_id);
 
 	printf("📝 [Part 3] 실무 달력(Calendar) 및 주기적(Periodic) 백그라운드 예약 등록\n");
-	scheduler_add_calendar(&s, "매시 정각 동기화", DAY_ANY, TIME_ANY, 0, 1, 0, POLICY_OVERLAP, 0, task_example_log, NULL);
-	scheduler_add_calendar(&s, "월요일 11시 백업", DAY_MON, 13, 15, 1, 0, POLICY_OVERLAP, 0, task_example_log, NULL);
-	scheduler_add_calendar(&s, "즉시실행 캘린더", DAY_MON, 0, 0, 1, 0, POLICY_OVERLAP, 1, task_example_log, NULL);
+	scheduler_add_calendar(&s, "매시 정각 동기화", DAY_ANY, TIME_ANY, 25, 1, 1, POLICY_OVERLAP, 0, task_example_log, NULL);
+	scheduler_add_calendar(&s, "금요일 03시 15분 백업", DAY_FRI, 3, 15, 1, 0, POLICY_OVERLAP, 0, task_example_log, NULL);
+	scheduler_add_calendar(&s, "금요일 00시 즉시실행 캘린더", DAY_FRI, 0, 0, 1, 1, POLICY_OVERLAP, 1, task_example_log, NULL);
 
-	printf("  -> ✅ 다양한 예약이 큐에 안전하게 등록되었습니다.\n\n");
+	//printf("  -> ✅ 다양한 예약이 큐에 안전하게 등록되었습니다.\n\n");
 	printf("\n⏳ 백그라운드 대기 모드 돌입... (종료하려면 Ctrl+C 누르세요!)\n\n");
 
 	while (!g_shutdown_flag) {
