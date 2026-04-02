@@ -20,6 +20,20 @@ typedef struct os_allocator {
 	atomic_int tot_allocs;
 } os_allocator_t;
 
+void os_sleep(long ms) {
+	struct timespec req, rem;
+	req.tv_sec = ms / 1000;
+	req.tv_nsec = (ms % 1000) * 1000000L;
+
+	while (nanosleep(&req, &rem) == -1) {
+		if (errno == EINTR) {
+			req = rem; // 인터럽트 발생 시 남은 시간으로 다시 대기
+		} else {
+			break;
+		}
+	}
+}
+
 static inline void os_allocator_init(os_allocator_t *alloc, const char *name)
 {
 	alloc->name = name;
@@ -328,6 +342,8 @@ void os_queue_insert(os_queue_t *q, void *p)
 	int i, new_cap;
 	void **new_items, *e;
 
+	if (!p || !q) return;
+
 	os_obj_hold(p); 
 	os_mutex_lock(&q->lock);
 
@@ -468,6 +484,7 @@ struct task {
 	int is_urgent;
 	enum overrun_policy policy;
 	int is_running_now;
+	time_t last_start_time;
 	task_func_t func;
 	void *arg;
 };
@@ -508,19 +525,23 @@ os_allocator_t time_allocator = { .name = "timedates",
 	.cur_allocs = 0, /* 최신 C 표준 지정 초기화자 (ATOMIC_VAR_INIT 제거) */
 	.tot_allocs = 0};
 
-os_str_t get_current_time_str(void)
+os_str_t get_time_str(time_t target_time)
 {
 	os_str_t res;
-	time_t now = time(NULL);
 	struct tm t;
 	const char *wday_name[] = {"일", "월", "화", "수", "목", "금", "토"};
 
-	localtime_r(&now, &t);
+	localtime_r(&target_time, &t);
 	res = os_str_fmt(&time_allocator, "%04d-%02d-%02d(%s) %02d:%02d:%02d",
 			t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
 			wday_name[t.tm_wday],
 			t.tm_hour, t.tm_min, t.tm_sec);
 	return res;
+}
+
+os_str_t get_current_time_str(void)
+{
+	return get_time_str(time(NULL));
 }
 
 struct timespec timespec_now_monotonic(void)
@@ -622,7 +643,9 @@ struct task *find_task(struct scheduler *s, uint64_t id)
 }
 
 /* 체이닝 작업 연쇄 트리거 함수 */
-static inline void _trigger_chain_locked(struct scheduler *s, uint64_t chain_to_id) {
+static inline void _trigger_chain_locked(struct scheduler *s, uint64_t chain_to_id) 
+{
+	if (s->is_shutting_down) return;
 	if (chain_to_id == 0) return;
 	struct task *ct = find_task(s, chain_to_id);
 	if (ct && ct->type == TYPE_CHAINED) {
@@ -781,10 +804,14 @@ void *scheduler_loop(void *arg)
 					if (t->policy == POLICY_SKIP) {
 						actual_run = 0;
 						os_str_t tt = get_current_time_str();
-						printf("[%s] ⚠️ [SKIP] '%s' (ID:%lu) 이전 작업 지연으로 인해 실행을 건너뜁니다!\n", 
-								os_str_get(&tt), os_str_get(&t->name), t->id);
+						os_str_t prev_tt = get_time_str(t->last_start_time);
+
+						printf("[%s] ⚠️ [SKIP] '%s' (ID:%lu) 이전 작업(시작: %s) 지연으로 인해 실행을 건너뜁니다!\n",
+								os_str_get(&tt), os_str_get(&t->name), t->id, os_str_get(&prev_tt));
+
 						os_str_free(&time_allocator, &tt);
-						
+						os_str_free(&time_allocator, &prev_tt);
+
 						if (t->type == TYPE_RELATIVE || t->type == TYPE_CHAINED) {
 							/* 🚨 FIX: interval_ms가 0일 때 무한루프(데드락) 방어 */
 							if (t->interval_ms > 0) {
@@ -804,6 +831,7 @@ void *scheduler_loop(void *arg)
 
 				if (actual_run) {
 					t->is_running_now++;
+					t->last_start_time = now_real;
 
 					j = os_malloc(&s->allocs.job, sizeof(struct job_item));
 					if (!j) {
@@ -1258,6 +1286,17 @@ void task_chain_step(struct task_context *ctx)
 	os_str_free(&time_allocator, &tt);
 }
 
+void task_mon(struct task_context *ctx)
+{
+	struct scheduler *sched = ctx->sched;
+	void *user_arg = ctx->user_arg;
+	while (!sched->is_shutting_down) {
+		printf("*** task_mon\n");
+		os_sleep(47*60*1000);
+	}
+	printf("*** exit task_mon\n");
+}
+
 int main(void)
 {
 	struct scheduler s;
@@ -1283,6 +1322,8 @@ int main(void)
 	scheduler_add_oneshot(&s, "1번 원샷", 0, 1, task_verify_success, NULL);
 	scheduler_add_oneshot(&s, "2번 원샷", 1000, 0, task_verify_success, NULL);
 	scheduler_add_oneshot(&s, "3번 원샷", 3000, 0, task_verify_success, NULL);
+	
+	scheduler_add_oneshot(&s, "monitor 쓰레드", 10*1000, 1, task_mon, NULL);
 	
 	uint64_t p_id = scheduler_add_periodic(&s, "4번 주기(30분)", 30*60*1000, 1, 1, POLICY_OVERLAP, 0, task_verify_success, NULL);
 
