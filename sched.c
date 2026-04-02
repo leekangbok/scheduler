@@ -115,7 +115,12 @@ static inline os_str_t os_str_dup(os_allocator_t *alloc, const os_str_t *src)
 
 	if (res.is_dynamic) {
 		res.data.heap = os_malloc(alloc, res.len + 1);
-		if (res.data.heap) memcpy(res.data.heap, src->data.heap, res.len + 1);
+		if (res.data.heap) {
+			memcpy(res.data.heap, src->data.heap, res.len + 1);
+		} else {
+			res.is_dynamic = 0;
+			res.len = 0;
+		}
 	} else {
 		memcpy(res.data.local, src->data.local, OS_SSO_LEN);
 	}
@@ -801,6 +806,10 @@ void *scheduler_loop(void *arg)
 					t->is_running_now++;
 
 					j = os_malloc(&s->allocs.job, sizeof(struct job_item));
+					if (!j) {
+						t->is_running_now--;
+						continue;
+					}
 					os_obj_init(j, &s->allocs.job, job_item_dtor);
 					j->name = os_str_dup(&s->allocs.job, &t->name);
 					j->func = t->func;
@@ -1272,10 +1281,10 @@ int main(void)
 	//scheduler_add_periodic(&s, "[SSO_TEST] 매우_긴_이름을_가진_스케줄러_작업입니다_123456789", 5*1000, 1, 0, POLICY_SKIP, 1, task_verify_ping, NULL);
 
 	scheduler_add_oneshot(&s, "1번 원샷", 0, 1, task_verify_success, NULL);
-	scheduler_add_oneshot(&s, "2번 원샷", 100, 0, task_verify_success, NULL);
-	scheduler_add_oneshot(&s, "3번 원샷", 300, 0, task_verify_success, NULL);
+	scheduler_add_oneshot(&s, "2번 원샷", 1000, 0, task_verify_success, NULL);
+	scheduler_add_oneshot(&s, "3번 원샷", 3000, 0, task_verify_success, NULL);
 	
-	uint64_t p_id = scheduler_add_periodic(&s, "4번 주기(700ms)", 30*60*1000, 1, 1, POLICY_OVERLAP, 0, task_verify_success, NULL);
+	uint64_t p_id = scheduler_add_periodic(&s, "4번 주기(30분)", 30*60*1000, 1, 1, POLICY_OVERLAP, 0, task_verify_success, NULL);
 
 	c_id = scheduler_add_oneshot(&s, "취소될 작업", 200, 0, task_verify_success, NULL);
 	scheduler_remove_task(&s, c_id);
@@ -1286,12 +1295,12 @@ int main(void)
 	//scheduler_add_chain(&s, b_id, "체인 손자 작업 [C]", 0, 1, 0, task_chain_step, NULL);
 	//printf("  -> ✅ 파이프라인(A ➡️ B ➡️ C) 예약 완료 (2초 뒤 발동)\n\n");
 
-	sleep(1);
+	sleep(10);
 	//scheduler_remove_task(&s, p_id);
 
 	printf("📝 [Part 3] 실무 달력(Calendar) 및 주기적(Periodic) 백그라운드 예약 등록\n");
-	scheduler_add_calendar(&s, "매시 정각 동기화", DAY_ANY, TIME_ANY, 25, 1, 1, POLICY_OVERLAP, 0, task_example_log, NULL);
-	scheduler_add_calendar(&s, "금요일 03시 15분 백업", DAY_FRI, 3, 15, 1, 0, POLICY_OVERLAP, 0, task_example_log, NULL);
+	scheduler_add_calendar(&s, "매시 30분 동기화", DAY_ANY, TIME_ANY, 30, 1, 1, POLICY_OVERLAP, 0, task_example_log, NULL);
+	scheduler_add_calendar(&s, "금요일 03시 15분 백업", DAY_FRI, 3, 15, 1, 1, POLICY_OVERLAP, 0, task_example_log, NULL);
 	scheduler_add_calendar(&s, "금요일 00시 즉시실행 캘린더", DAY_FRI, 0, 0, 1, 1, POLICY_OVERLAP, 1, task_example_log, NULL);
 
 	//printf("  -> ✅ 다양한 예약이 큐에 안전하게 등록되었습니다.\n\n");
