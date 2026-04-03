@@ -1058,6 +1058,40 @@ int scheduler_stop(struct scheduler *s, int timeout_sec)
 	return total_leaks;
 }
 
+/**
+ * @brief 특정 작업이 완전히 종료될 때까지 대기합니다. (pthread_join 대체)
+ * @param timeout_ms 대기할 최대 시간 (OS_TIMEOUT(-1) 이면 무한 대기)
+ * @return 0: 정상 종료 확인, -1: 타임아웃 또는 작업 없음
+ */
+int scheduler_wait_task(struct scheduler *s, uint64_t task_id, long timeout_ms)
+{
+	long start_ms = get_mono_ms();
+
+	while (1) {
+		os_mutex_lock(&s->lock);
+		struct task *t = find_task(s, task_id);
+
+		// 1. 작업이 이미 지워졌거나,
+		// 2. 예약이 취소(is_active=0)되고 물리적 실행도 끝난(is_running_now=0) 상태라면 종료
+		if (!t || (!t->is_active && t->is_running_now == 0)) {
+			os_mutex_unlock(&s->lock);
+			return 0; // 작업 완료됨
+		}
+		os_mutex_unlock(&s->lock);
+
+		// 타임아웃 검사
+		if (timeout_ms != OS_TIMEOUT) {
+			long elapsed = get_mono_ms() - start_ms;
+			if (elapsed >= timeout_ms) {
+				return -1; // 타임아웃
+			}
+		}
+
+		// 작업이 끝날 때 wakeup_event가 발생하므로 대기 (최대 100ms씩 끊어서 데드락 방지)
+		os_event_wait(s->wakeup_event, 100);
+	}
+}
+
 uint64_t scheduler_add_oneshot(struct scheduler *s, const char *name, long delay, int is_urgent, task_func_t f, void *a)
 {
 	int idx;
@@ -1089,6 +1123,26 @@ uint64_t scheduler_add_oneshot(struct scheduler *s, const char *name, long delay
 	os_mutex_unlock(&s->lock);
 
 	return id;
+}
+
+/**
+ * @brief 큐를 이용해 워커 풀(Worker Pool)에서 비동기로 작업을 실행합니다. (권장)
+ * 반복적인 pthread_create를 대체하며 리소스 오버헤드가 없습니다.
+ */
+uint64_t scheduler_run_async(struct scheduler *s, const char *name, task_func_t f, void *arg)
+{
+	// delay=0, is_urgent=0 (워커 풀 사용)
+	return scheduler_add_oneshot(s, name, 0, 0, f, arg);
+}
+
+/**
+ * @brief 이 작업만을 위한 독립적인 전용 스레드를 생성하여 즉시 실행합니다.
+ * 무한 루프나 장시간 블로킹되는 네트워크 소켓 대기 작업에 적합합니다.
+ */
+uint64_t scheduler_run_thread(struct scheduler *s, const char *name, task_func_t f, void *arg)
+{
+	// delay=0, is_urgent=1 (즉시 독립 스레드 생성 및 detach)
+	return scheduler_add_oneshot(s, name, 0, 1, f, arg);
 }
 
 uint64_t scheduler_add_periodic(struct scheduler *s, const char *name, long interval, int thr, int is_urgent,
@@ -1291,10 +1345,8 @@ void task_mon(struct task_context *ctx)
 	struct scheduler *sched = ctx->sched;
 	void *user_arg = ctx->user_arg;
 	while (!sched->is_shutting_down) {
-		printf("*** task_mon\n");
-		os_sleep(47*60*1000);
+		os_sleep(5*1000);
 	}
-	printf("*** exit task_mon\n");
 }
 
 int main(void)
