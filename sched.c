@@ -146,10 +146,15 @@ static inline int os_str_set(os_allocator_t *alloc, os_str_t *s, const char *str
 	if (!s)
 		return -1;
 
-	if (!str) {
+	if (s->is_dynamic && s->data.heap) {
+		os_free(alloc, s->data.heap);
+		s->is_dynamic = 0;
+	}
+
+	if (!str || len == 0) {
 		s->len = 0;
 		s->is_dynamic = 0;
-		s->data.heap[0] = '\0';
+		s->data.local[0] = '\0';
 		return 0;
 	}
 
@@ -165,6 +170,7 @@ static inline int os_str_set(os_allocator_t *alloc, os_str_t *s, const char *str
 		if (!s->data.heap) {
 			s->len = 0;
 			s->is_dynamic = 0;
+			s->data.local[0] = '\0';
 			return -1;
 		}
 		memcpy(s->data.heap, str, len);
